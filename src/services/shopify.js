@@ -13,39 +13,6 @@ export function normalizeCustomerGid(id) {
   throw new Error(`Invalid Shopify customer id: "${id}" (expected a numeric id or gid://shopify/Customer/...)`);
 }
 
-const CREDIT_MUTATION = `
-  mutation StoreCreditCredit($id: ID!, $creditInput: StoreCreditAccountCreditInput!) {
-    storeCreditAccountCredit(id: $id, creditInput: $creditInput) {
-      storeCreditAccountTransaction {
-        account { id balance { amount currencyCode } }
-      }
-      userErrors { field message }
-    }
-  }
-`;
-
-const DEBIT_MUTATION = `
-  mutation StoreCreditDebit($id: ID!, $debitInput: StoreCreditAccountDebitInput!) {
-    storeCreditAccountDebit(id: $id, debitInput: $debitInput) {
-      storeCreditAccountTransaction {
-        account { id balance { amount currencyCode } }
-      }
-      userErrors { field message }
-    }
-  }
-`;
-
-const STORE_CREDIT_QUERY = `
-  query CustomerStoreCredit($id: ID!) {
-    customer(id: $id) {
-      id
-      storeCreditAccounts(first: 10) {
-        nodes { id balance { amount currencyCode } }
-      }
-    }
-  }
-`;
-
 const TAGS_ADD_MUTATION = `
   mutation AddTags($id: ID!, $tags: [String!]!) {
     tagsAdd(id: $id, tags: $tags) {
@@ -68,6 +35,15 @@ const CUSTOMER_BY_EMAIL_QUERY = `
   query FindCustomerByEmail($query: String!) {
     customers(first: 1, query: $query) {
       nodes { id email }
+    }
+  }
+`;
+
+const CUSTOMER_CREATE_MUTATION = `
+  mutation CreateCustomer($input: CustomerInput!) {
+    customerCreate(input: $input) {
+      customer { id email }
+      userErrors { field message }
     }
   }
 `;
@@ -118,6 +94,18 @@ export function createShopifyService(config, deps = {}) {
     }
   }
 
+  // Sending an account invite has no GraphQL mutation, so this uses the REST
+  // Admin API with the same token. numericId is the tail of the customer GID.
+  async function restPost(pathTail) {
+    const token = await tokenProvider.getToken();
+    const url = `https://${config.shopify.shop}/admin/api/${config.shopify.apiVersion}/${pathTail}`;
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
+      body: '{}',
+    });
+  }
+
   return {
     normalizeCustomerGid,
     tokenSource: () => tokenProvider.activeSource?.() ?? 'unknown',
@@ -126,53 +114,6 @@ export function createShopifyService(config, deps = {}) {
     // the logs instead of at the first webhook (when real money is moving).
     async warmUpToken() {
       await tokenProvider.getToken();
-    },
-
-    // Returns the customer's store credit account in the membership currency,
-    // or null if they don't have one yet (first credit creates it).
-    async getStoreCreditAccount(customerGid) {
-      const data = await graphql(STORE_CREDIT_QUERY, { id: customerGid });
-      if (!data.customer) {
-        throw new Error(`Shopify customer not found: ${customerGid}`);
-      }
-      const accounts = data.customer.storeCreditAccounts?.nodes ?? [];
-      return accounts.find((a) => a.balance.currencyCode === config.membership.currency) ?? null;
-    },
-
-    // `id` may be the customer GID — Shopify creates/uses the store credit
-    // account for that owner+currency automatically.
-    async creditStoreCredit(customerGid, amount) {
-      const data = await graphql(CREDIT_MUTATION, {
-        id: customerGid,
-        creditInput: {
-          creditAmount: { amount, currencyCode: config.membership.currency },
-        },
-      });
-      const payload = data.storeCreditAccountCredit;
-      assertNoUserErrors('storeCreditAccountCredit', payload?.userErrors);
-      const account = payload?.storeCreditAccountTransaction?.account;
-      if (!account) {
-        throw new Error(`Shopify storeCreditAccountCredit returned no transaction for ${customerGid}`);
-      }
-      return { accountId: account.id, balance: account.balance };
-    },
-
-    // Debit requires the store credit ACCOUNT gid (read it first via
-    // getStoreCreditAccount) — debiting a non-existent account is an error.
-    async debitStoreCredit(accountGid, amount) {
-      const data = await graphql(DEBIT_MUTATION, {
-        id: accountGid,
-        debitInput: {
-          debitAmount: { amount, currencyCode: config.membership.currency },
-        },
-      });
-      const payload = data.storeCreditAccountDebit;
-      assertNoUserErrors('storeCreditAccountDebit', payload?.userErrors);
-      const account = payload?.storeCreditAccountTransaction?.account;
-      if (!account) {
-        throw new Error(`Shopify storeCreditAccountDebit returned no transaction for ${accountGid}`);
-      }
-      return { accountId: account.id, balance: account.balance };
     },
 
     async addTag(customerGid, tag) {
@@ -189,6 +130,38 @@ export function createShopifyService(config, deps = {}) {
       const escaped = String(email).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
       const data = await graphql(CUSTOMER_BY_EMAIL_QUERY, { query: `email:"${escaped}"` });
       return data.customers?.nodes?.[0]?.id ?? null;
+    },
+
+    async createCustomer(email) {
+      const data = await graphql(CUSTOMER_CREATE_MUTATION, { input: { email } });
+      assertNoUserErrors('customerCreate', data.customerCreate?.userErrors);
+      const gid = data.customerCreate?.customer?.id;
+      if (!gid) throw new Error(`Shopify customerCreate returned no customer for ${email}`);
+      return gid;
+    },
+
+    // Best-effort account-invite email. On classic accounts this emails the
+    // activation link; on new customer accounts there is no invite (members log
+    // in with an emailed code), so a 4xx here is expected and non-fatal — we
+    // never fail the membership grant over it.
+    async sendAccountInvite(customerGid) {
+      const numericId = String(customerGid).split('/').pop();
+      const res = await restPost(`customers/${numericId}/send_invite.json`);
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        return { sent: false, status: res.status, detail: text.slice(0, 200) };
+      }
+      return { sent: true };
+    },
+
+    // Resolve a Shopify customer from an email, creating one (and inviting them)
+    // if none exists. Returns { gid, created }.
+    async findOrCreateCustomer(email) {
+      const existing = await this.findCustomerByEmail(email);
+      if (existing) return { gid: existing, created: false };
+      const gid = await this.createCustomer(email);
+      const invite = await this.sendAccountInvite(gid);
+      return { gid, created: true, invite };
     },
   };
 }

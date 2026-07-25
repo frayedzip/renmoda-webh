@@ -2,15 +2,19 @@
 // crashes the process immediately instead of failing at the first webhook —
 // which on this service means failing while real money is moving.
 
+import fs from 'node:fs';
+import path from 'node:path';
+
 const REQUIRED = [
   'RAZORPAY_KEY_ID',
   'RAZORPAY_KEY_SECRET',
   'RAZORPAY_WEBHOOK_SECRET',
-  'RAZORPAY_PLAN_ID',
   'SHOPIFY_SHOP',
-  'JOIN_SUCCESS_URL',
   'JOIN_FAILURE_URL',
 ];
+// JOIN_SUCCESS_URL is intentionally NOT required: there's no redirect back from
+// Razorpay in this flow (the account-invite email brings new members into
+// Shopify), so nothing reads it. Kept optional for a possible future redirect.
 
 function toInt(value, name) {
   const n = Number.parseInt(value, 10);
@@ -20,11 +24,48 @@ function toInt(value, name) {
   return n;
 }
 
-function toBool(value, name) {
-  const s = String(value).toLowerCase().trim();
-  if (['true', '1', 'yes'].includes(s)) return true;
-  if (['false', '0', 'no'].includes(s)) return false;
-  throw new Error(`Config error: ${name} must be true/false, got "${value}"`);
+// The plan catalog lives in a committed JSON file (not env) because it's a
+// multi-field table per tier. Each membership button links to
+// /join?plan=<key>; <key> maps to a Razorpay plan (its price = the monthly fee)
+// and the customer tag applied while the membership is active. Validated hard
+// at boot — a typo'd plan id would otherwise only surface when someone tries to
+// subscribe.
+function loadPlans(plansPath) {
+  let raw;
+  try {
+    raw = fs.readFileSync(path.resolve(plansPath), 'utf8');
+  } catch (err) {
+    throw new Error(`Config error: cannot read plans file at "${plansPath}": ${err.message}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`Config error: "${plansPath}" is not valid JSON: ${err.message}`);
+  }
+
+  // Keys starting with _ (e.g. _comment) are documentation, not plans.
+  const entries = Object.entries(parsed).filter(([key]) => !key.startsWith('_'));
+  if (entries.length === 0) {
+    throw new Error(
+      `Config error: "${plansPath}" defines no plans. Add at least one entry: ` +
+        '{ "<key>": { "razorpayPlanId": "plan_...", "tag": "membership-..." } }.'
+    );
+  }
+
+  const plans = {};
+  for (const [key, def] of entries) {
+    if (!def || typeof def !== 'object' || Array.isArray(def)) {
+      throw new Error(`Config error: plan "${key}" must be an object with razorpayPlanId and tag.`);
+    }
+    const razorpayPlanId = String(def.razorpayPlanId ?? '').trim();
+    const tag = String(def.tag ?? '').trim();
+    if (!razorpayPlanId) throw new Error(`Config error: plan "${key}" is missing "razorpayPlanId".`);
+    if (!tag) throw new Error(`Config error: plan "${key}" is missing "tag".`);
+    plans[key] = { key, razorpayPlanId, tag };
+  }
+  return plans;
 }
 
 export function loadConfig(env = process.env) {
@@ -49,9 +90,8 @@ export function loadConfig(env = process.env) {
   // Shopify auth comes in two shapes:
   //   - Legacy in-admin custom app  -> a static Admin token (shpat_...).
   //   - New Dev Dashboard app       -> client id + secret, which we exchange
-  //     for a 24h Admin token via the client credentials grant at runtime
-  //     (see services/shopify-token.js). Shopify removed static tokens for
-  //     apps created after the Dev Dashboard migration.
+  //     for an Admin token at runtime (client credentials on a dev store, or an
+  //     OAuth offline token on a production store; see services/shopify-token.js).
   const rawAdminToken = (env.SHOPIFY_ADMIN_TOKEN ?? '').trim();
   // .env.example ships a "shpat_xxxx..." placeholder; treat that as unset so a
   // half-filled .env falls through to client credentials instead of sending a
@@ -64,20 +104,21 @@ export function loadConfig(env = process.env) {
     throw new Error(
       'Config error: Shopify auth not configured. Set SHOPIFY_ADMIN_TOKEN (legacy static ' +
         'token) OR both SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET (Dev Dashboard app — the ' +
-        'service mints an Admin token from them via the client credentials grant).'
+        'service mints an Admin token from them).'
     );
   }
 
-  const allowance = toInt(env.MEMBERSHIP_ALLOWANCE ?? '4000', 'MEMBERSHIP_ALLOWANCE');
+  const plansPath = env.PLANS_PATH ?? './plans.json';
 
   return {
     port: toInt(env.PORT ?? '3000', 'PORT'),
     dbPath: env.DB_PATH ?? './data/membership.db',
+    plansPath,
+    plans: loadPlans(plansPath),
     razorpay: {
       keyId: env.RAZORPAY_KEY_ID,
       keySecret: env.RAZORPAY_KEY_SECRET,
       webhookSecret: env.RAZORPAY_WEBHOOK_SECRET,
-      planId: env.RAZORPAY_PLAN_ID,
       // 120 monthly cycles = 10 years; Razorpay requires a finite count, this
       // is the practical equivalent of "until cancelled".
       totalCount: toInt(env.RAZORPAY_TOTAL_COUNT ?? '120', 'RAZORPAY_TOTAL_COUNT'),
@@ -94,14 +135,6 @@ export function loadConfig(env = process.env) {
       // unset. Set it behind a proxy where the public URL differs from the
       // internal host. Must match an Allowed redirection URL in the app config.
       oauthRedirectUri: (env.SHOPIFY_REDIRECT_URI ?? '').trim() || null,
-    },
-    membership: {
-      allowance,
-      currency: env.MEMBERSHIP_CURRENCY ?? 'INR',
-      // Business policy the client hasn't finalized: does leftover credit
-      // survive membership end? Flag, not code, so it can flip without a deploy.
-      revokeCreditOnEnd: toBool(env.REVOKE_CREDIT_ON_END ?? 'true', 'REVOKE_CREDIT_ON_END'),
-      activeTag: env.ACTIVE_MEMBER_TAG ?? 'active_member',
     },
     join: {
       successUrl: env.JOIN_SUCCESS_URL,

@@ -51,11 +51,15 @@ function main() {
   const store = createStore(config.dbPath);
   const shopify = createShopifyService(config, { log, store });
   const razorpay = createRazorpayService(config);
-  const membership = createMembershipService({ config, store, shopify, log });
+  const membership = createMembershipService({ store, shopify, razorpay, log });
 
   const app = createApp({ config, store, shopify, razorpay, membership, log });
   const server = app.listen(config.port, () => {
-    log.info('listening', { port: config.port, shop: config.shopify.shop });
+    log.info('listening', {
+      port: config.port,
+      shop: config.shopify.shop,
+      plans: Object.keys(config.plans),
+    });
   });
 
   // Verify Shopify auth at boot. Non-fatal on failure: a transient Shopify

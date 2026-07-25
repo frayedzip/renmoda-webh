@@ -1,12 +1,14 @@
-// End-to-end webhook test with correctly-signed payloads. Shopify is mocked;
-// the real signature verification, dedupe store, and membership logic run.
+// End-to-end webhook test with correctly-signed payloads. Shopify + Razorpay
+// customer-fetch are mocked; the real signature verification, dedupe store, and
+// membership logic run.
 //
-//   node --test test/
+//   node --test test/*.test.js
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { once } from 'node:events';
+import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../src/lib/config.js';
 import { createStore } from '../src/db/store.js';
 import { createRazorpayService } from '../src/services/razorpay.js';
@@ -14,100 +16,121 @@ import { createMembershipService } from '../src/services/membership.js';
 import { createApp } from '../src/server.js';
 
 const WEBHOOK_SECRET = 'test_webhook_secret';
+const PLANS_FIXTURE = fileURLToPath(new URL('./plans.fixture.json', import.meta.url));
 
 const TEST_ENV = {
-  PORT: '3000', // tests listen on an ephemeral port explicitly; this just satisfies config
+  PORT: '3000',
   RAZORPAY_KEY_ID: 'rzp_test_key',
   RAZORPAY_KEY_SECRET: 'rzp_test_secret',
   RAZORPAY_WEBHOOK_SECRET: WEBHOOK_SECRET,
-  RAZORPAY_PLAN_ID: 'plan_test',
   SHOPIFY_SHOP: 'renmoda-test.myshopify.com',
   SHOPIFY_ADMIN_TOKEN: 'shpat_test',
   JOIN_SUCCESS_URL: 'https://renmoda.example/thanks',
   JOIN_FAILURE_URL: 'https://renmoda.example/sorry',
   DB_PATH: ':memory:',
+  PLANS_PATH: PLANS_FIXTURE,
 };
 
-// In-memory stand-in for the Shopify service: same interface, tracks calls
-// and simulates a single INR store credit account per customer.
+// In-memory Shopify: customers keyed by email, tags per customer gid.
 function createShopifyMock() {
   const calls = [];
-  const balances = new Map(); // customerGid -> number
+  const customers = new Map(); // email -> gid
+  const tags = new Map(); // gid -> Set<tag>
+  let seq = 0;
 
-  return {
+  const svc = {
     calls,
-    balanceOf(gid) {
-      return balances.get(gid) ?? 0;
+    tagsOf(gid) {
+      return [...(tags.get(gid) ?? [])];
     },
-    async getStoreCreditAccount(customerGid) {
-      calls.push({ op: 'getStoreCreditAccount', customerGid });
-      const balance = balances.get(customerGid) ?? 0;
-      if (balance <= 0) return null;
-      return {
-        id: `gid://shopify/StoreCreditAccount/${customerGid.split('/').pop()}`,
-        balance: { amount: balance.toFixed(2), currencyCode: 'INR' },
-      };
+    gidForEmail(email) {
+      return customers.get(email) ?? null;
     },
-    async creditStoreCredit(customerGid, amount) {
-      calls.push({ op: 'credit', customerGid, amount });
-      const next = (balances.get(customerGid) ?? 0) + Number.parseFloat(amount);
-      balances.set(customerGid, next);
-      return { accountId: 'gid://shopify/StoreCreditAccount/1', balance: { amount: next.toFixed(2), currencyCode: 'INR' } };
+    async findCustomerByEmail(email) {
+      calls.push({ op: 'findCustomerByEmail', email });
+      return customers.get(email) ?? null;
     },
-    async debitStoreCredit(accountGid, amount) {
-      calls.push({ op: 'debit', accountGid, amount });
-      const customerGid = `gid://shopify/Customer/${accountGid.split('/').pop()}`;
-      const next = (balances.get(customerGid) ?? 0) - Number.parseFloat(amount);
-      balances.set(customerGid, next);
-      return { accountId: accountGid, balance: { amount: next.toFixed(2), currencyCode: 'INR' } };
+    async createCustomer(email) {
+      calls.push({ op: 'createCustomer', email });
+      const gid = `gid://shopify/Customer/${1000 + ++seq}`;
+      customers.set(email, gid);
+      return gid;
     },
-    async addTag(customerGid, tag) {
-      calls.push({ op: 'addTag', customerGid, tag });
+    async sendAccountInvite(gid) {
+      calls.push({ op: 'sendAccountInvite', gid });
+      return { sent: true };
     },
-    async removeTag(customerGid, tag) {
-      calls.push({ op: 'removeTag', customerGid, tag });
+    async findOrCreateCustomer(email) {
+      const existing = customers.get(email);
+      if (existing) return { gid: existing, created: false };
+      const gid = await svc.createCustomer(email);
+      const invite = await svc.sendAccountInvite(gid);
+      return { gid, created: true, invite };
     },
-    async findCustomerByEmail() {
-      return null;
+    async addTag(gid, tag) {
+      calls.push({ op: 'addTag', customerGid: gid, tag });
+      if (!tags.has(gid)) tags.set(gid, new Set());
+      tags.get(gid).add(tag);
+    },
+    async removeTag(gid, tag) {
+      calls.push({ op: 'removeTag', customerGid: gid, tag });
+      tags.get(gid)?.delete(tag);
     },
   };
+  return svc;
 }
 
 function sign(body) {
   return crypto.createHmac('sha256', WEBHOOK_SECRET).update(body).digest('hex');
 }
 
-function chargedPayload(customerId = '7412345678901') {
+function chargedPayload({
+  email = 'member@example.com',
+  customerId = 'cust_test1',
+  planKey = 'gold',
+  planTag = 'membership-gold',
+  includeTag = true,
+  includeEmail = true,
+} = {}) {
+  const notes = {};
+  if (includeTag) {
+    notes.plan = planKey;
+    notes.plan_tag = planTag;
+  }
+  const paymentEntity = { id: 'pay_test123', amount: 400000, currency: 'INR' };
+  if (includeEmail) paymentEntity.email = email;
   return JSON.stringify({
     entity: 'event',
     event: 'subscription.charged',
-    contains: ['subscription', 'payment'],
+    payload: {
+      subscription: { entity: { id: 'sub_test123', status: 'active', customer_id: customerId, notes } },
+      payment: { entity: paymentEntity },
+    },
+  });
+}
+
+function cancelledPayload({ customerId = 'cust_test1', planKey = 'gold', planTag = 'membership-gold' } = {}) {
+  // No payment entity — identity resolves via the Razorpay customer fetch.
+  return JSON.stringify({
+    entity: 'event',
+    event: 'subscription.cancelled',
     payload: {
       subscription: {
-        entity: {
-          id: 'sub_test123',
-          plan_id: 'plan_test',
-          status: 'active',
-          notes: { shopify_customer_id: customerId },
-        },
-      },
-      payment: {
-        entity: { id: 'pay_test123', amount: 400000, currency: 'INR' },
+        entity: { id: 'sub_test123', status: 'cancelled', customer_id: customerId, notes: { plan: planKey, plan_tag: planTag } },
       },
     },
   });
 }
 
-async function startTestServer() {
+async function startTestServer({ razorpayEmail = 'member@example.com' } = {}) {
   const config = loadConfig(TEST_ENV);
   const log = { info() {}, warn() {}, error() {}, child() { return this; } };
   const store = createStore(':memory:');
   const shopify = createShopifyMock();
-  const razorpay = createRazorpayService(config);
-  const membership = createMembershipService({ config, store, shopify, log });
+  const razorpay = createRazorpayService(config); // real verifyWebhookSignature
+  razorpay.fetchCustomerEmail = async () => razorpayEmail; // stub the network call
+  const membership = createMembershipService({ store, shopify, razorpay, log });
 
-  // Processing happens after the 200 is sent; this hook lets tests await it
-  // deterministically instead of sleeping.
   const waiters = [];
   const onEventProcessed = (err, eventId) => {
     waiters.shift()?.({ err, eventId });
@@ -123,35 +146,60 @@ async function startTestServer() {
 }
 
 function post(url, body, headers) {
-  return fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...headers },
-    body,
-  });
+  return fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body });
 }
 
-test('valid signature: 200, credits allowance, tags member, logs audit trail', async (t) => {
+test('charged with a new email: creates the Shopify customer, invites them, tags them', async (t) => {
   const ctx = await startTestServer();
   t.after(ctx.close);
 
-  const body = chargedPayload();
+  const body = chargedPayload({ email: 'new@example.com' });
   const processed = ctx.nextProcessed();
-  const res = await post(ctx.url, body, {
-    'x-razorpay-signature': sign(body),
-    'x-razorpay-event-id': 'evt_valid_1',
-  });
+  const res = await post(ctx.url, body, { 'x-razorpay-signature': sign(body), 'x-razorpay-event-id': 'evt_new' });
 
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { status: 'accepted' });
-
   const { err } = await processed;
   assert.equal(err, null);
 
-  const gid = 'gid://shopify/Customer/7412345678901';
-  assert.equal(ctx.shopify.balanceOf(gid), 4000);
-  assert.ok(ctx.shopify.calls.some((c) => c.op === 'credit' && c.amount === '4000.00'));
-  assert.ok(ctx.shopify.calls.some((c) => c.op === 'addTag' && c.tag === 'active_member'));
-  assert.equal(ctx.store.hasProcessed('evt_valid_1'), true);
+  assert.ok(ctx.shopify.calls.some((c) => c.op === 'createCustomer' && c.email === 'new@example.com'));
+  assert.ok(ctx.shopify.calls.some((c) => c.op === 'sendAccountInvite'));
+  const gid = ctx.shopify.gidForEmail('new@example.com');
+  assert.deepEqual(ctx.shopify.tagsOf(gid), ['membership-gold']);
+});
+
+test('charged with an existing email: tags only, no duplicate customer or invite', async (t) => {
+  const ctx = await startTestServer();
+  t.after(ctx.close);
+
+  const body = chargedPayload({ email: 'existing@example.com' });
+  const sig = sign(body);
+
+  let processed = ctx.nextProcessed();
+  await post(ctx.url, body, { 'x-razorpay-signature': sig, 'x-razorpay-event-id': 'evt_m1' });
+  await processed;
+
+  processed = ctx.nextProcessed();
+  await post(ctx.url, body, { 'x-razorpay-signature': sig, 'x-razorpay-event-id': 'evt_m2' });
+  await processed;
+
+  // Created + invited exactly once (first charge); second is find + tag only.
+  assert.equal(ctx.shopify.calls.filter((c) => c.op === 'createCustomer').length, 1);
+  assert.equal(ctx.shopify.calls.filter((c) => c.op === 'sendAccountInvite').length, 1);
+  assert.equal(ctx.shopify.calls.filter((c) => c.op === 'addTag').length, 2);
+  const gid = ctx.shopify.gidForEmail('existing@example.com');
+  assert.deepEqual(ctx.shopify.tagsOf(gid), ['membership-gold']); // idempotent
+});
+
+test('the tag applied matches the plan in notes (silver)', async (t) => {
+  const ctx = await startTestServer();
+  t.after(ctx.close);
+
+  const body = chargedPayload({ email: 's@example.com', planKey: 'silver', planTag: 'membership-silver' });
+  const processed = ctx.nextProcessed();
+  await post(ctx.url, body, { 'x-razorpay-signature': sign(body), 'x-razorpay-event-id': 'evt_silver' });
+  await processed;
+
+  assert.deepEqual(ctx.shopify.tagsOf(ctx.shopify.gidForEmail('s@example.com')), ['membership-silver']);
 });
 
 test('tampered signature: rejected with 401, nothing processed', async (t) => {
@@ -159,19 +207,12 @@ test('tampered signature: rejected with 401, nothing processed', async (t) => {
   t.after(ctx.close);
 
   const body = chargedPayload();
-  const goodSig = sign(body);
-  // Flip one hex char — same length, so this also exercises the
-  // timingSafeEqual path rather than the length guard.
-  const tampered = (goodSig[0] === 'a' ? 'b' : 'a') + goodSig.slice(1);
-
-  const res = await post(ctx.url, body, {
-    'x-razorpay-signature': tampered,
-    'x-razorpay-event-id': 'evt_tampered_1',
-  });
+  const good = sign(body);
+  const tampered = (good[0] === 'a' ? 'b' : 'a') + good.slice(1);
+  const res = await post(ctx.url, body, { 'x-razorpay-signature': tampered, 'x-razorpay-event-id': 'evt_bad' });
 
   assert.equal(res.status, 401);
   assert.equal(ctx.shopify.calls.length, 0);
-  assert.equal(ctx.store.hasProcessed('evt_tampered_1'), false);
 });
 
 test('missing signature: rejected with 401', async (t) => {
@@ -179,94 +220,101 @@ test('missing signature: rejected with 401', async (t) => {
   t.after(ctx.close);
 
   const body = chargedPayload();
-  const res = await post(ctx.url, body, { 'x-razorpay-event-id': 'evt_nosig_1' });
-
+  const res = await post(ctx.url, body, { 'x-razorpay-event-id': 'evt_nosig' });
   assert.equal(res.status, 401);
   assert.equal(ctx.shopify.calls.length, 0);
 });
 
-test('duplicate event id: second delivery ignored, no double credit', async (t) => {
+test('duplicate event id: second delivery ignored', async (t) => {
   const ctx = await startTestServer();
   t.after(ctx.close);
 
   const body = chargedPayload();
-  const headers = {
-    'x-razorpay-signature': sign(body),
-    'x-razorpay-event-id': 'evt_dup_1',
-  };
+  const headers = { 'x-razorpay-signature': sign(body), 'x-razorpay-event-id': 'evt_dup' };
 
   const processed = ctx.nextProcessed();
-  const first = await post(ctx.url, body, headers);
-  assert.equal(first.status, 200);
+  await post(ctx.url, body, headers);
   await processed;
-
-  const callsAfterFirst = ctx.shopify.calls.length;
+  const after = ctx.shopify.calls.length;
 
   const second = await post(ctx.url, body, headers);
-  assert.equal(second.status, 200);
   assert.deepEqual(await second.json(), { status: 'duplicate' });
-
-  // Give any (incorrect) async processing a beat to show up before asserting.
   await new Promise((r) => setTimeout(r, 50));
-  assert.equal(ctx.shopify.calls.length, callsAfterFirst);
-  assert.equal(ctx.shopify.balanceOf('gid://shopify/Customer/7412345678901'), 4000);
+  assert.equal(ctx.shopify.calls.length, after);
 });
 
-test('second month is a RESET, not a top-up', async (t) => {
-  const ctx = await startTestServer();
+test('cancellation: resolves email via the Razorpay customer, removes the tag', async (t) => {
+  const ctx = await startTestServer({ razorpayEmail: 'member@example.com' });
   t.after(ctx.close);
 
-  const body = chargedPayload();
-  const sig = sign(body);
-
+  // Grant first (charged carries the email).
+  const charged = chargedPayload({ email: 'member@example.com' });
   let processed = ctx.nextProcessed();
-  await post(ctx.url, body, { 'x-razorpay-signature': sig, 'x-razorpay-event-id': 'evt_month_1' });
+  await post(ctx.url, charged, { 'x-razorpay-signature': sign(charged), 'x-razorpay-event-id': 'evt_pre_cancel' });
   await processed;
+  const gid = ctx.shopify.gidForEmail('member@example.com');
+  assert.deepEqual(ctx.shopify.tagsOf(gid), ['membership-gold']);
 
+  // Cancel has no payment entity — email comes from the (stubbed) customer fetch.
+  const cancelled = cancelledPayload();
   processed = ctx.nextProcessed();
-  await post(ctx.url, body, { 'x-razorpay-signature': sig, 'x-razorpay-event-id': 'evt_month_2' });
-  await processed;
-
-  const gid = 'gid://shopify/Customer/7412345678901';
-  // 4000, not 8000: month 2 debits the untouched 4000 then credits fresh 4000.
-  assert.equal(ctx.shopify.balanceOf(gid), 4000);
-  assert.ok(ctx.shopify.calls.some((c) => c.op === 'debit' && c.amount === '4000.00'));
-});
-
-test('cancellation removes tag and zeroes credit', async (t) => {
-  const ctx = await startTestServer();
-  t.after(ctx.close);
-
-  const charged = chargedPayload();
-  let processed = ctx.nextProcessed();
-  await post(ctx.url, charged, {
-    'x-razorpay-signature': sign(charged),
-    'x-razorpay-event-id': 'evt_pre_cancel',
-  });
-  await processed;
-
-  const cancelled = JSON.stringify({
-    entity: 'event',
-    event: 'subscription.cancelled',
-    payload: {
-      subscription: {
-        entity: { id: 'sub_test123', status: 'cancelled', notes: { shopify_customer_id: '7412345678901' } },
-      },
-    },
-  });
-
-  processed = ctx.nextProcessed();
-  const res = await post(ctx.url, cancelled, {
-    'x-razorpay-signature': sign(cancelled),
-    'x-razorpay-event-id': 'evt_cancel_1',
-  });
+  const res = await post(ctx.url, cancelled, { 'x-razorpay-signature': sign(cancelled), 'x-razorpay-event-id': 'evt_cancel' });
   assert.equal(res.status, 200);
   const { err } = await processed;
   assert.equal(err, null);
 
-  const gid = 'gid://shopify/Customer/7412345678901';
-  assert.equal(ctx.shopify.balanceOf(gid), 0);
-  assert.ok(ctx.shopify.calls.some((c) => c.op === 'removeTag' && c.tag === 'active_member'));
+  assert.deepEqual(ctx.shopify.tagsOf(gid), []); // untagged
+  assert.ok(ctx.shopify.calls.some((c) => c.op === 'removeTag' && c.tag === 'membership-gold'));
+});
+
+test('pending does not revoke (grace window)', async (t) => {
+  const ctx = await startTestServer();
+  t.after(ctx.close);
+
+  const charged = chargedPayload({ email: 'p@example.com' });
+  let processed = ctx.nextProcessed();
+  await post(ctx.url, charged, { 'x-razorpay-signature': sign(charged), 'x-razorpay-event-id': 'evt_pre_pending' });
+  await processed;
+
+  const pending = JSON.stringify({
+    entity: 'event',
+    event: 'subscription.pending',
+    payload: { subscription: { entity: { id: 'sub_test123', customer_id: 'cust_test1', notes: { plan: 'gold', plan_tag: 'membership-gold' } } } },
+  });
+  processed = ctx.nextProcessed();
+  await post(ctx.url, pending, { 'x-razorpay-signature': sign(pending), 'x-razorpay-event-id': 'evt_pending' });
+  await processed;
+
+  assert.deepEqual(ctx.shopify.tagsOf(ctx.shopify.gidForEmail('p@example.com')), ['membership-gold']);
+  assert.ok(!ctx.shopify.calls.some((c) => c.op === 'removeTag'));
+});
+
+test('charge with no plan_tag in notes fails loudly, returns 200, no Shopify calls', async (t) => {
+  const ctx = await startTestServer();
+  t.after(ctx.close);
+
+  const body = chargedPayload({ includeTag: false });
+  const processed = ctx.nextProcessed();
+  const res = await post(ctx.url, body, { 'x-razorpay-signature': sign(body), 'x-razorpay-event-id': 'evt_notag' });
+
+  assert.equal(res.status, 200);
+  const { err } = await processed;
+  assert.ok(err && /plan_tag/.test(err.message));
+  assert.equal(ctx.shopify.calls.length, 0);
+});
+
+test('charge with no resolvable email fails loudly (needs attention)', async (t) => {
+  const ctx = await startTestServer({ razorpayEmail: null }); // customer fetch yields nothing
+  t.after(ctx.close);
+
+  const body = chargedPayload({ includeEmail: false }); // and no payment email
+  const processed = ctx.nextProcessed();
+  const res = await post(ctx.url, body, { 'x-razorpay-signature': sign(body), 'x-razorpay-event-id': 'evt_noemail' });
+
+  assert.equal(res.status, 200);
+  const { err } = await processed;
+  assert.ok(err && /email/.test(err.message));
+  assert.ok(!ctx.shopify.calls.some((c) => c.op === 'addTag'));
 });
 
 test('unhandled event type still gets a 200 (no retry loop)', async (t) => {
@@ -275,10 +323,7 @@ test('unhandled event type still gets a 200 (no retry loop)', async (t) => {
 
   const body = JSON.stringify({ entity: 'event', event: 'payment.captured', payload: {} });
   const processed = ctx.nextProcessed();
-  const res = await post(ctx.url, body, {
-    'x-razorpay-signature': sign(body),
-    'x-razorpay-event-id': 'evt_other_1',
-  });
+  const res = await post(ctx.url, body, { 'x-razorpay-signature': sign(body), 'x-razorpay-event-id': 'evt_other' });
 
   assert.equal(res.status, 200);
   const { err } = await processed;

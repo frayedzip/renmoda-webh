@@ -1,0 +1,7 @@
+{
+  "_comment": "Plan catalog. Each storefront membership button links to /join/redirect?customerId=...&plan=<key>. On a successful charge the customer gets `tag`; on membership end it's removed. razorpayPlanId is the Razorpay Subscriptions plan (its amount is the monthly fee). Add one entry per tier. Keys beginning with _ are ignored. Seeded with the plan id from the old single-plan config — rename the key/tag to your real tier and add the rest.",
+  "standard": {
+    "razorpayPlanId": "plan_TGtFfp7xjJ78m6",
+    "tag": "membership-standard"
+  }
+}

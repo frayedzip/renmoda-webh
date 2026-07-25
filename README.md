@@ -1,8 +1,10 @@
 # Renmoda Membership Service
 
 Recurring membership engine for Renmoda: members pay a monthly fee via
-**Razorpay Subscriptions** (UPI Autopay / card mandate) and receive **Shopify
-store credit** they spend renting garments through normal Shopify checkout.
+**Razorpay Subscriptions** (UPI Autopay / card mandate) and, while their
+subscription is active, carry a **plan tag** on their Shopify customer record.
+The tag identifies which tier they're on; the storefront uses it to gate
+access / benefits.
 
 Shopify's native subscription APIs cannot bill through Razorpay (Razorpay is
 excluded as a recurring gateway and Shopify Payments doesn't exist in India),
@@ -12,38 +14,55 @@ via webhooks.
 
 ## How it works
 
+The visitor does **not** need a Shopify account first. They click a plan button
+(carrying only the plan), enter their details on **Razorpay**, and their Shopify
+identity is derived afterward from the email Razorpay collected.
+
 ```
-Member ── POST /join ──> this service ──> Razorpay subscription (short_url)
-Member completes UPI Autopay / card mandate on Razorpay's hosted page
-Razorpay ── webhooks ──> this service ──> Shopify Admin GraphQL
+Member clicks a plan button ──> GET /join/redirect?plan=<key>
+  ──> this service creates a Razorpay subscription (notes = {plan, plan_tag})
+      and 302s to subscription.short_url
+Member enters email + completes UPI Autopay / card mandate on Razorpay
+Razorpay ── webhooks ──> this service:
+      resolve email ──> find-or-create Shopify customer (new → account invite)
+      ──> add the plan tag
 ```
+
+Each plan (`gold`, `silver`, …) maps in `plans.json` to a Razorpay plan id and a
+customer tag. At `/join` the chosen plan's tag is stamped into the subscription
+`notes`, so every webhook carries the tag to apply — no catalog lookup at webhook
+time.
 
 | Razorpay event            | Action                                                        |
 | ------------------------- | ------------------------------------------------------------- |
-| `subscription.activated`  | Add `active_member` tag, set store credit to ₹4000            |
-| `subscription.charged`    | Ensure tag, **reset** credit to ₹4000 (debit to 0, credit)    |
+| `subscription.charged`    | Resolve email → find-or-create customer → add the plan tag    |
+| `subscription.activated`  | Best-effort add (no payment email yet; `charged` grants)      |
 | `subscription.pending`    | Log only — grace window while Razorpay retries the charge     |
-| `subscription.halted`     | Remove tag, zero credit (payment retries exhausted)           |
-| `subscription.cancelled`  | Remove tag, zero credit (member cancelled autopay)            |
-| `subscription.completed`  | Remove tag, zero credit (term finished)                       |
+| `subscription.halted`     | Resolve email → remove the plan tag (retries exhausted)       |
+| `subscription.cancelled`  | Resolve email → remove the plan tag (member cancelled)        |
+| `subscription.completed`  | Resolve email → remove the plan tag (term finished)           |
 | anything else             | Log and 200                                                   |
 
 Key design points (don't "simplify" these away):
 
-- **Reset, not top-up.** Monthly charge wipes leftover credit and grants a
-  fresh ₹4000. Members can't bank months and pull 8–12 items at once.
-- **Reset fires on `subscription.charged`, never a cron.** Credit stays in
-  lockstep with money actually collected; a failed/retried charge naturally
-  delays the fresh credit.
-- **No customer-mapping table.** The Shopify customer GID is written into the
-  Razorpay subscription's `notes` at creation and echoed back on every
-  webhook.
-- **SQLite dedupes webhook deliveries.** Razorpay redelivers on timeout; a
-  duplicate `subscription.charged` without dedupe would double-credit.
-  `credit_log` is the audit trail for "why does this member have this balance?"
-- **Whether leftover credit survives membership end** is the
-  `REVOKE_CREDIT_ON_END` flag (default `true`) — an unfinalized business
-  decision, deliberately config not code.
+- **Identity comes from Razorpay, not the button.** The button carries only the
+  plan. The member's email is read from `payload.payment.entity.email` on
+  `charged` (or, on events with no payment entity, by fetching the Razorpay
+  customer via `payload.subscription.entity.customer_id`). From the email we
+  find-or-create the Shopify customer; new ones get an **account-invite email**,
+  which is how they enter Shopify — so no redirect back from Razorpay is needed.
+- **The tag rides in the subscription `notes`, not a lookup.** Stamped at
+  `/join`, echoed on every webhook, so the handler needs no catalog lookup and
+  stays correct even if `plans.json` changes.
+- **Tagging is idempotent.** A charge just (re-)adds the tag; no
+  reset/top-up/allowance and no cron. `subscription.pending` never removes the
+  tag — it's the grace window while Razorpay retries; only `halted` means
+  retries are exhausted.
+- **SQLite dedupes webhook deliveries.** Razorpay redelivers on timeout;
+  `membership_log` is the audit trail for "why does this member have this tag?"
+- **Fails loudly** (logged with `needs_attention`) when a charge has no
+  `plan_tag`, or when a revoke can't resolve the member's email (so the tag
+  isn't silently left on a cancelled member).
 
 ## Setup
 
@@ -104,26 +123,39 @@ token depends on your store type:
 
 Required scopes (either option):
 
-- `read_customers`, `write_customers` (tags)
-- `read_store_credit_accounts`
-- `read_store_credit_account_transactions`, `write_store_credit_account_transactions`
+- `read_customers`, `write_customers` (this service only reads/writes customer
+  tags — no store-credit scopes needed)
 
 The service verifies auth at boot: look for `"msg":"shopify auth ready"` with
 `source` (`static` / `offline` / `client_credentials`) in the logs, or a loud
 `needs_attention` error if auth isn't set up yet. Run `npm run verify:shopify`
 any time to check auth **and** the `read_customers` scope in one shot.
 
-Also required for members to actually *spend* credit:
+### 3. Plans
 
-- Settings → Customer accounts → use **new customer accounts** (store credit
-  at checkout requires them).
-- Settings → Payments → make sure **store credit** is enabled as a payment
-  method.
+Define your tiers in `plans.json` — one entry per storefront membership button:
 
-### 3. Razorpay
+```json
+{
+  "gold":   { "razorpayPlanId": "plan_ABC123", "tag": "membership-gold" },
+  "silver": { "razorpayPlanId": "plan_DEF456", "tag": "membership-silver" }
+}
+```
 
-1. Create a monthly **Plan** (Dashboard → Subscriptions → Plans) with the
-   membership fee. Put its id in `RAZORPAY_PLAN_ID`.
+- **key** (`gold`) — what the storefront button passes as `?plan=gold`.
+- **razorpayPlanId** — the Razorpay Subscriptions plan (Dashboard → Subscriptions
+  → Plans); its amount is that tier's monthly fee.
+- **tag** — the customer tag applied while the membership is active and removed
+  when it ends. This is what the storefront gates on.
+
+Keys starting with `_` (e.g. `_comment`) are ignored. The catalog is validated
+at boot — a missing/blank `razorpayPlanId` or `tag` crashes startup with a clear
+message. Override the path with `PLANS_PATH` if needed.
+
+### 4. Razorpay
+
+1. Create a monthly **Plan** per tier (Dashboard → Subscriptions → Plans) and put
+   each plan id in `plans.json` (above).
 2. Register the webhook: Dashboard → Account & Settings → Webhooks → Add:
    - URL: `https://<your-domain>/webhooks/razorpay`
    - Secret: a long random string → `RAZORPAY_WEBHOOK_SECRET`
@@ -136,7 +168,7 @@ Also required for members to actually *spend* credit:
      - `subscription.cancelled`
      - `subscription.completed`
 
-### 4. Run
+### 5. Run
 
 ```bash
 npm start        # loads .env; equivalent to: node --env-file-if-exists=.env src/server.js
@@ -148,11 +180,11 @@ npm test         # signed-webhook end-to-end tests, Shopify mocked
 ### `POST /join`
 
 ```json
-{ "shopifyCustomerId": "7412345678901", "email": "member@example.com" }
+{ "plan": "gold" }
 ```
 
-`shopifyCustomerId` may be numeric or a full `gid://shopify/Customer/…`. If
-only `email` is given, the customer is looked up in Shopify. Returns:
+`plan` is required and must be a key in `plans.json` (unknown/missing → 400). No
+customer info — the member enters that on Razorpay. Returns:
 
 ```json
 { "subscriptionId": "sub_…", "shortUrl": "https://rzp.io/i/…" }
@@ -160,15 +192,23 @@ only `email` is given, the customer is looked up in Shopify. Returns:
 
 Send the member to `shortUrl` to authorize autopay.
 
-### `GET /join/redirect?customerId=…`
+### `GET /join/redirect?plan=…`
 
-Same, but 302s straight to the Razorpay page — so the storefront button can be
-a plain link (Liquid: `{{ customer.id }}`), no JS. On failure it 302s to
+Same, but 302s straight to the Razorpay page — so each storefront plan button is
+a plain static link (no customer object, works for logged-out visitors):
+
+```liquid
+<a href="https://membership.renmoda.in/join/redirect?plan=gold">Join Gold</a>
+<a href="https://membership.renmoda.in/join/redirect?plan=silver">Join Silver</a>
+```
+
+On any failure (missing/unknown plan, Razorpay error) it 302s to
 `JOIN_FAILURE_URL`.
 
 > The join flow **must** go through this backend: each member needs their own
-> subscription with their customer id in `notes`, otherwise the webhook can't
-> tell whose wallet to credit. Never hand out one shared payment link.
+> subscription with the **plan tag** in `notes`, and identity is later resolved
+> from the email Razorpay collects. Never hand out one shared payment link — the
+> webhook would have no per-member subscription to key on.
 
 ### `POST /webhooks/razorpay`
 
@@ -198,17 +238,17 @@ One JSON line per event on stdout/stderr. The line to alert on:
 ```
 
 Razorpay will **not** redeliver an event we already 200'd, so these need a
-human. Reconciliation query for a member's balance history:
+human. Reconciliation query for a member's tag history:
 
 ```bash
 sqlite3 data/membership.db \
-  "SELECT created_at, event_type, action, amount, balance_after, note
-   FROM credit_log WHERE shopify_customer_id LIKE '%<numeric id>' ORDER BY id;"
+  "SELECT created_at, event_type, action, tag, note
+   FROM membership_log WHERE shopify_customer_id LIKE '%<numeric id>' ORDER BY id;"
 ```
 
-A `processed_events` row with **no** matching `credit_log` rows for a
+A `processed_events` row with **no** matching `membership_log` rows for a
 `subscription.charged` event means processing died mid-flight (crash/API
-failure) — re-apply the credit by hand in Shopify admin.
+failure) — re-apply the tag by hand in Shopify admin.
 
 ### VPS deploy (Hetzner + systemd + Caddy)
 
@@ -216,7 +256,7 @@ failure) — re-apply the credit by hand in Shopify admin.
 
 ```ini
 [Unit]
-Description=Renmoda membership service (Razorpay -> Shopify store credit)
+Description=Renmoda membership service (Razorpay -> Shopify plan tags)
 After=network-online.target
 Wants=network-online.target
 

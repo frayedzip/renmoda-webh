@@ -13,14 +13,9 @@ import crypto from 'node:crypto';
 // carries refresh_token + expires_in and the token provider refreshes it.
 
 // The Admin scopes this service needs. Kept here as the single source of truth
-// for both the authorize URL and setup docs.
-export const REQUIRED_SCOPES = [
-  'read_customers',
-  'write_customers',
-  'read_store_credit_accounts',
-  'read_store_credit_account_transactions',
-  'write_store_credit_account_transactions',
-];
+// for the authorize URL. This service only reads/writes customer tags, so these
+// two are all it requests — no store-credit scopes.
+export const REQUIRED_SCOPES = ['read_customers', 'write_customers'];
 
 export function buildAuthorizeUrl({ shop, clientId, scopes, redirectUri, state }) {
   const params = new URLSearchParams({

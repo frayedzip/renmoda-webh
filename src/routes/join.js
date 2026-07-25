@@ -1,62 +1,60 @@
 import { Router } from 'express';
-import { normalizeCustomerGid } from '../services/shopify.js';
 
-// Join MUST go through this backend: each member needs their OWN Razorpay
-// subscription with their Shopify customer id in notes. A single shared
-// payment link would leave the webhook with no way to tell whose wallet to
-// credit.
+// Join takes ONLY a plan. The member has no Shopify account yet — they enter
+// their details on Razorpay's hosted page, and identity is resolved from that
+// email when the webhook fires (see services/membership.js). So the storefront
+// button is a plain static link, usable by logged-out visitors:
+//   <a href="https://.../join/redirect?plan=gold">Join Gold</a>
 
-export function createJoinRouter({ config, razorpay, shopify, log }) {
+export function createJoinRouter({ config, razorpay, log }) {
   const router = Router();
 
-  async function resolveCustomerGid(shopifyCustomerId, email) {
-    if (shopifyCustomerId) {
-      return normalizeCustomerGid(shopifyCustomerId);
+  function resolvePlan(planKey) {
+    if (!planKey) {
+      const err = new Error(`plan is required. Known plans: ${Object.keys(config.plans).join(', ')}`);
+      err.statusCode = 400;
+      throw err;
     }
-    if (email) {
-      const gid = await shopify.findCustomerByEmail(email);
-      if (!gid) {
-        const err = new Error(`No Shopify customer found for email ${email}`);
-        err.statusCode = 404;
-        throw err;
-      }
-      return gid;
+    const plan = config.plans[planKey];
+    if (!plan) {
+      const err = new Error(`unknown plan "${planKey}". Known plans: ${Object.keys(config.plans).join(', ')}`);
+      err.statusCode = 400;
+      throw err;
     }
-    const err = new Error('shopifyCustomerId or email is required');
-    err.statusCode = 400;
-    throw err;
+    return plan;
+  }
+
+  function createSubscriptionFor(plan) {
+    return razorpay.createSubscription({
+      planId: plan.razorpayPlanId,
+      planKey: plan.key,
+      planTag: plan.tag,
+    });
   }
 
   router.post('/', async (req, res) => {
-    const { shopifyCustomerId, email } = req.body ?? {};
+    const { plan: planKey } = req.body ?? {};
     try {
-      const customerGid = await resolveCustomerGid(shopifyCustomerId, email);
-      const { subscriptionId, shortUrl } = await razorpay.createSubscription({
-        shopifyCustomerId: customerGid,
-        email,
-      });
-      log.info('subscription created', { subscriptionId, customerGid });
+      const plan = resolvePlan(planKey);
+      const { subscriptionId, shortUrl } = await createSubscriptionFor(plan);
+      log.info('subscription created', { subscriptionId, plan: plan.key, tag: plan.tag });
       res.status(200).json({ subscriptionId, shortUrl });
     } catch (err) {
-      log.error('join failed', { error: err.message, shopifyCustomerId, email });
+      log.error('join failed', { error: err.message, plan: planKey });
       res.status(err.statusCode ?? 502).json({ error: err.message });
     }
   });
 
-  // Plain-link variant so the storefront button needs zero JS:
-  // <a href="https://.../join/redirect?customerId={{ customer.id }}">Join</a>
+  // Plain-link variant so the storefront button needs zero JS.
   router.get('/redirect', async (req, res) => {
-    const { customerId, email } = req.query;
+    const { plan: planKey } = req.query;
     try {
-      const customerGid = await resolveCustomerGid(customerId, email);
-      const { subscriptionId, shortUrl } = await razorpay.createSubscription({
-        shopifyCustomerId: customerGid,
-        email,
-      });
-      log.info('subscription created (redirect flow)', { subscriptionId, customerGid });
+      const plan = resolvePlan(planKey);
+      const { subscriptionId, shortUrl } = await createSubscriptionFor(plan);
+      log.info('subscription created (redirect flow)', { subscriptionId, plan: plan.key, tag: plan.tag });
       res.redirect(302, shortUrl);
     } catch (err) {
-      log.error('join redirect failed', { error: err.message, customerId, email });
+      log.error('join redirect failed', { error: err.message, plan: planKey });
       res.redirect(302, config.join.failureUrl);
     }
   });

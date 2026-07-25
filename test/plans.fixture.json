@@ -1,0 +1,4 @@
+{
+  "gold": { "razorpayPlanId": "plan_gold_test", "tag": "membership-gold" },
+  "silver": { "razorpayPlanId": "plan_silver_test", "tag": "membership-silver" }
+}

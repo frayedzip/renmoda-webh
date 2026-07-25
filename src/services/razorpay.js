@@ -26,17 +26,19 @@ export function createRazorpayService(config) {
       return crypto.timingSafeEqual(expectedBuf, actualBuf);
     },
 
-    // Each member gets their OWN subscription with their Shopify customer ID
-    // stamped into notes. Razorpay echoes notes back on every webhook, which is
-    // the entire identity-mapping strategy — no mapping table to drift.
-    async createSubscription({ shopifyCustomerId, email }) {
+    // The subscription is created from just the plan — no customer yet. The
+    // member enters their details ON Razorpay's hosted page, so identity is
+    // resolved later from the email Razorpay collected (see membership.js). Only
+    // the plan's tag is stamped into notes; Razorpay echoes notes back on every
+    // webhook, so the handler knows which tag to apply without a catalog lookup.
+    async createSubscription({ planId, planKey, planTag }) {
       const subscription = await client.subscriptions.create({
-        plan_id: config.razorpay.planId,
+        plan_id: planId,
         total_count: config.razorpay.totalCount,
         customer_notify: 1,
         notes: {
-          shopify_customer_id: shopifyCustomerId,
-          ...(email ? { email } : {}),
+          plan: planKey,
+          plan_tag: planTag,
         },
       });
       return {
@@ -44,6 +46,15 @@ export function createRazorpayService(config) {
         shortUrl: subscription.short_url,
         status: subscription.status,
       };
+    },
+
+    // Identity fallback for events that carry no payment entity (activated,
+    // halted, cancelled): the subscription entity always has customer_id, and
+    // the Razorpay customer holds the email the member entered at checkout.
+    async fetchCustomerEmail(customerId) {
+      if (!customerId) return null;
+      const customer = await client.customers.fetch(customerId);
+      return customer?.email ?? null;
     },
   };
 }

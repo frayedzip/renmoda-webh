@@ -1,103 +1,100 @@
-import { normalizeCustomerGid } from './shopify.js';
-
 // Business logic per Razorpay event.
 //
-// Monthly behaviour is RESET, not top-up: debit the wallet to zero, then
-// credit the allowance. A top-up would let members bank multiple months and
-// pull 8-12 garments at once; membership means "4 items this month", not
-// "4 items I can accumulate". The reset fires off subscription.charged (never
-// a 30-day cron) so credit stays in lockstep with money actually collected —
-// a retried/failed charge naturally delays the fresh credit.
+// Identity comes from Razorpay, not from Shopify: the member enters their email
+// on Razorpay's hosted page, so we resolve WHO they are from the webhook:
+//   - `subscription.charged`/`completed` carry payload.payment.entity.email.
+//   - other events (activated/halted/cancelled) have no payment entity, so we
+//     fetch the Razorpay customer (payload.subscription.entity.customer_id) for
+//     the email.
+// From the email we find-or-create the Shopify customer (new ones get an account
+// invite) and add/remove the plan tag. The plan tag itself still rides in the
+// subscription notes (stamped at /join), so no plan-catalog lookup is needed.
+//
+// Tagging is idempotent, so the model is: tag when money arrives, untag when the
+// membership ends.
 
-export function createMembershipService({ config, store, shopify, log }) {
-  const allowanceStr = config.membership.allowance.toFixed(2);
-  const currency = config.membership.currency;
-  const tag = config.membership.activeTag;
-
-  function extractCustomerGid(body) {
-    const rawId = body?.payload?.subscription?.entity?.notes?.shopify_customer_id;
-    if (!rawId) {
-      // Without notes.shopify_customer_id we have no idea whose wallet this
-      // is. That means the subscription was created outside POST /join —
-      // a human needs to trace it, not code.
+export function createMembershipService({ store, shopify, razorpay, log }) {
+  function extractPlanTag(body) {
+    const notes = body?.payload?.subscription?.entity?.notes ?? {};
+    const tag = notes.plan_tag;
+    if (!tag) {
       throw new Error(
-        'Webhook payload has no notes.shopify_customer_id — subscription was not created via /join'
+        'Webhook payload has no notes.plan_tag — cannot determine which plan tag to apply/remove'
       );
     }
-    return normalizeCustomerGid(rawId);
+    return { tag, planKey: notes.plan ?? null };
   }
 
-  // Debit existing balance to zero, then credit the full allowance.
-  // Done as two explicit ledger entries (not a computed delta) so the audit
-  // trail reads exactly like the business rule: "wiped old month, granted new".
-  async function resetCredit(customerGid, { eventId, eventType }) {
-    const account = await shopify.getStoreCreditAccount(customerGid);
-    const existing = account ? Number.parseFloat(account.balance.amount) : 0;
+  // Email from the payment entity when present, else from the Razorpay customer.
+  // Returns null if it genuinely can't be resolved (caller decides severity).
+  async function resolveEmail(body) {
+    const paymentEmail = body?.payload?.payment?.entity?.email;
+    if (paymentEmail) return paymentEmail;
+    const customerId = body?.payload?.subscription?.entity?.customer_id;
+    return razorpay.fetchCustomerEmail(customerId);
+  }
 
-    if (account && existing > 0) {
-      const debited = await shopify.debitStoreCredit(account.id, existing.toFixed(2));
-      store.logCredit({
-        eventId,
-        eventType,
-        shopifyCustomerId: customerGid,
-        action: 'debit',
-        amount: existing.toFixed(2),
-        currency,
-        balanceAfter: debited.balance.amount,
-        note: 'monthly reset: clear unspent balance',
-      });
+  async function grant(body, ctx, { emailRequired }) {
+    const { tag, planKey } = extractPlanTag(body);
+    const email = await resolveEmail(body);
+    if (!email) {
+      // `charged` always carries a payment email; if we still can't resolve one
+      // that's a real problem. `activated` legitimately has none yet — the
+      // first `charged` (which follows) will grant, so defer quietly.
+      if (emailRequired) {
+        throw new Error('Cannot resolve member email on a charge event (no payment email, no Razorpay customer email)');
+      }
+      log.info('grant deferred: no email yet, awaiting first charge', { ...ctx, plan: planKey });
+      return;
     }
 
-    const credited = await shopify.creditStoreCredit(customerGid, allowanceStr);
-    store.logCredit({
-      eventId,
-      eventType,
-      shopifyCustomerId: customerGid,
-      action: 'credit',
-      amount: allowanceStr,
-      currency,
-      balanceAfter: credited.balance.amount,
-      note: 'monthly allowance',
+    const { gid, created, invite } = await shopify.findOrCreateCustomer(email);
+    await shopify.addTag(gid, tag);
+    store.logMembership({
+      eventId: ctx.eventId,
+      eventType: ctx.eventType,
+      shopifyCustomerId: gid,
+      action: 'tag_added',
+      tag,
+      note: `plan ${planKey ?? '(unknown)'}${created ? ' (new customer, invited)' : ''}`,
     });
-
-    return credited.balance;
-  }
-
-  async function zeroCredit(customerGid, { eventId, eventType }) {
-    const account = await shopify.getStoreCreditAccount(customerGid);
-    const existing = account ? Number.parseFloat(account.balance.amount) : 0;
-    if (!account || existing <= 0) return;
-
-    const debited = await shopify.debitStoreCredit(account.id, existing.toFixed(2));
-    store.logCredit({
-      eventId,
-      eventType,
-      shopifyCustomerId: customerGid,
-      action: 'debit',
-      amount: existing.toFixed(2),
-      currency,
-      balanceAfter: debited.balance.amount,
-      note: 'membership ended: revoke remaining credit',
-    });
-  }
-
-  async function grant(customerGid, ctx) {
-    const balance = await resetCredit(customerGid, ctx);
-    await shopify.addTag(customerGid, tag);
-    log.info('membership granted', { ...ctx, customerGid, balance: balance.amount });
-  }
-
-  async function revoke(customerGid, ctx, reason) {
-    await shopify.removeTag(customerGid, tag);
-    if (config.membership.revokeCreditOnEnd) {
-      await zeroCredit(customerGid, ctx);
-    }
-    log.info('membership revoked', {
+    log.info('plan tag granted', {
       ...ctx,
-      customerGid,
-      reason,
-      creditRevoked: config.membership.revokeCreditOnEnd,
+      customerGid: gid,
+      email,
+      plan: planKey,
+      tag,
+      newCustomer: created,
+      inviteSent: created ? invite?.sent : undefined,
     });
+  }
+
+  async function revoke(body, ctx, reason) {
+    const { tag, planKey } = extractPlanTag(body);
+    const email = await resolveEmail(body);
+    if (!email) {
+      // We can't identify whom to untag — the member could retain access. Flag
+      // loudly for a human rather than silently leaving them tagged.
+      throw new Error(
+        `Cannot resolve member email on ${ctx.eventType} — plan tag NOT removed, needs manual attention`
+      );
+    }
+
+    const gid = await shopify.findCustomerByEmail(email);
+    if (!gid) {
+      log.warn('revoke: no Shopify customer for email, nothing to untag', { ...ctx, email, plan: planKey });
+      return;
+    }
+    await shopify.removeTag(gid, tag);
+    store.logMembership({
+      eventId: ctx.eventId,
+      eventType: ctx.eventType,
+      shopifyCustomerId: gid,
+      action: 'tag_removed',
+      tag,
+      note: reason,
+    });
+    log.info('plan tag revoked', { ...ctx, customerGid: gid, email, plan: planKey, tag, reason });
   }
 
   return {
@@ -105,17 +102,21 @@ export function createMembershipService({ config, store, shopify, log }) {
       const ctx = { eventId, eventType };
 
       switch (eventType) {
-        case 'subscription.activated':
         case 'subscription.charged':
-          // activated = mandate approved + first charge; charged = renewal.
-          // Both mean "money just arrived", so both grant the fresh month.
-          await grant(extractCustomerGid(body), ctx);
+          // Renewal or first charge — always carries the payment email.
+          await grant(body, ctx, { emailRequired: true });
+          break;
+
+        case 'subscription.activated':
+          // Mandate approved; no payment entity. Best-effort — the first charge
+          // grants for real.
+          await grant(body, ctx, { emailRequired: false });
           break;
 
         case 'subscription.pending':
           // Grace window: Razorpay is still retrying the charge (transient
-          // bank/UPI declines are common). Revoking here punishes members for
-          // their bank's flakiness — only `halted` means retries exhausted.
+          // bank/UPI declines are common). Removing access here punishes members
+          // for their bank's flakiness — only `halted` means retries exhausted.
           log.info('payment pending, grace window — no action', {
             ...ctx,
             subscriptionId: body?.payload?.subscription?.entity?.id,
@@ -123,15 +124,15 @@ export function createMembershipService({ config, store, shopify, log }) {
           break;
 
         case 'subscription.halted':
-          await revoke(extractCustomerGid(body), ctx, 'payment retries exhausted');
+          await revoke(body, ctx, 'payment retries exhausted');
           break;
 
         case 'subscription.cancelled':
-          await revoke(extractCustomerGid(body), ctx, 'member cancelled autopay');
+          await revoke(body, ctx, 'member cancelled autopay');
           break;
 
         case 'subscription.completed':
-          await revoke(extractCustomerGid(body), ctx, 'subscription term completed');
+          await revoke(body, ctx, 'subscription term completed');
           break;
 
         default:
