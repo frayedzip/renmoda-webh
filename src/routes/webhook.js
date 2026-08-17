@@ -28,6 +28,16 @@ export function createWebhookRouter({ store, razorpay, membership, log, onEventP
       req.get('x-razorpay-event-id') ||
       crypto.createHash('sha256').update(req.rawBody).digest('hex');
 
+    // Log arrival before any processing: this is what distinguishes "Razorpay
+    // never sent the event" from "we got it and it did nothing" — the first
+    // question to answer when a cancellation appears to have been ignored.
+    log.info('webhook received', {
+      eventId,
+      eventType,
+      subscriptionId: body?.payload?.subscription?.entity?.id ?? null,
+      subscriptionStatus: body?.payload?.subscription?.entity?.status ?? null,
+    });
+
     // Claim BEFORE acking so a concurrent duplicate delivery can't slip in
     // between the response and the insert.
     if (!store.claimEvent(eventId, eventType)) {

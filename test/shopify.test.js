@@ -168,3 +168,70 @@ test('userErrors in a mutation payload are surfaced as an error', async () => {
     globalThis.fetch = original;
   }
 });
+
+test('removeTags sends the whole list in one mutation and returns the resulting tags', async () => {
+  const tokenProvider = { activeSource: () => 'static', async getToken() { return 'shpat_x'; } };
+  const sent = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (_url, opts) => {
+    sent.push(JSON.parse(opts.body).variables);
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          data: {
+            tagsRemove: {
+              node: { id: 'gid://shopify/Customer/1', tags: ['wholesale', 'newsletter'] },
+              userErrors: [],
+            },
+          },
+        };
+      },
+    };
+  };
+  try {
+    const shopify = createShopifyService(config, { tokenProvider });
+    const remaining = await shopify.removeTags('gid://shopify/Customer/1', [
+      'membership-gold',
+      'membership-silver',
+    ]);
+    assert.equal(sent.length, 1, 'one round trip, not one per tag');
+    assert.deepEqual(sent[0].tags, ['membership-gold', 'membership-silver']);
+    assert.deepEqual(remaining, ['wholesale', 'newsletter']); // untouched tags survive
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('removeTags with an empty list makes no API call at all', async () => {
+  const tokenProvider = { activeSource: () => 'static', async getToken() { return 'shpat_x'; } };
+  const original = globalThis.fetch;
+  let called = false;
+  globalThis.fetch = async () => { called = true; return tagsAddOk; };
+  try {
+    const shopify = createShopifyService(config, { tokenProvider });
+    assert.equal(await shopify.removeTags('gid://shopify/Customer/1', []), null);
+    assert.equal(called, false);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('removeTags surfaces userErrors instead of reporting a phantom success', async () => {
+  const tokenProvider = { activeSource: () => 'static', async getToken() { return 'shpat_x'; } };
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return { data: { tagsRemove: { node: null, userErrors: [{ field: ['id'], message: 'no such customer' }] } } };
+    },
+  });
+  try {
+    const shopify = createShopifyService(config, { tokenProvider });
+    await assert.rejects(() => shopify.removeTags('gid://shopify/Customer/9', ['membership-gold']), /userErrors/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

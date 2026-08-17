@@ -55,15 +55,47 @@ export function createStore(dbPath) {
     );
   `);
 
+  // Additive migration, safe to re-run against a live prod DB. The original
+  // audit trail recorded only the Shopify customer id, so nothing linked a
+  // Razorpay subscription to the Shopify customer we tagged for it. That link is
+  // what a revoke needs: `charged` identifies the member by the PAYMENT email
+  // while `cancelled` (no payment entity) identifies them by the RAZORPAY
+  // CUSTOMER email, and those two fields are not guaranteed to match. Without
+  // the link, a mismatch means the untag silently finds nobody.
+  const membershipLogColumns = new Set(
+    db.prepare('PRAGMA table_info(membership_log)').all().map((column) => column.name)
+  );
+  if (!membershipLogColumns.has('subscription_id')) {
+    db.exec('ALTER TABLE membership_log ADD COLUMN subscription_id TEXT');
+  }
+  if (!membershipLogColumns.has('email')) {
+    db.exec('ALTER TABLE membership_log ADD COLUMN email TEXT');
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_membership_log_subscription
+      ON membership_log (subscription_id, id);
+  `);
+
   const claimStmt = db.prepare(
     'INSERT OR IGNORE INTO processed_events (event_id, event_type, received_at) VALUES (?, ?, ?)'
   );
   const hasStmt = db.prepare('SELECT 1 FROM processed_events WHERE event_id = ?');
   const logStmt = db.prepare(`
     INSERT INTO membership_log
-      (event_id, event_type, shopify_customer_id, action, tag, note, created_at)
+      (event_id, event_type, shopify_customer_id, action, tag, note, created_at,
+       subscription_id, email)
     VALUES
-      (@eventId, @eventType, @shopifyCustomerId, @action, @tag, @note, @createdAt)
+      (@eventId, @eventType, @shopifyCustomerId, @action, @tag, @note, @createdAt,
+       @subscriptionId, @email)
+  `);
+  // Most recent grant for a subscription — the fallback identity for a revoke
+  // whose email lookup came up empty.
+  const lastGrantStmt = db.prepare(`
+    SELECT shopify_customer_id, email, tag, created_at
+    FROM membership_log
+    WHERE subscription_id = ? AND action = 'tag_added'
+    ORDER BY id DESC
+    LIMIT 1
   `);
 
   const getTokenStmt = db.prepare(
@@ -93,7 +125,16 @@ export function createStore(dbPath) {
       return result.changes > 0;
     },
 
-    logMembership({ eventId, eventType, shopifyCustomerId, action, tag, note = null }) {
+    logMembership({
+      eventId,
+      eventType,
+      shopifyCustomerId,
+      action,
+      tag,
+      note = null,
+      subscriptionId = null,
+      email = null,
+    }) {
       logStmt.run({
         eventId,
         eventType,
@@ -102,7 +143,24 @@ export function createStore(dbPath) {
         tag,
         note,
         createdAt: new Date().toISOString(),
+        subscriptionId,
+        email,
       });
+    },
+
+    // Who did we tag for this Razorpay subscription? Returns null for
+    // subscriptions granted before this column existed, or never granted at all
+    // — the caller must treat those two cases as "unknown", not "nobody".
+    findLastGrant(subscriptionId) {
+      if (!subscriptionId) return null;
+      const row = lastGrantStmt.get(subscriptionId);
+      if (!row) return null;
+      return {
+        shopifyCustomerId: row.shopify_customer_id,
+        email: row.email,
+        tag: row.tag,
+        createdAt: row.created_at,
+      };
     },
 
     getShopifyToken(shop) {

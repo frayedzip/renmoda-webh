@@ -35,12 +35,12 @@ time.
 
 | Razorpay event            | Action                                                        |
 | ------------------------- | ------------------------------------------------------------- |
-| `subscription.charged`    | Resolve email → find-or-create customer → add the plan tag    |
+| `subscription.charged`    | Find-or-create customer → add this plan's tag, clear other tiers |
 | `subscription.activated`  | Best-effort add (no payment email yet; `charged` grants)      |
 | `subscription.pending`    | Log only — grace window while Razorpay retries the charge     |
-| `subscription.halted`     | Resolve email → remove the plan tag (retries exhausted)       |
-| `subscription.cancelled`  | Resolve email → remove the plan tag (member cancelled)        |
-| `subscription.completed`  | Resolve email → remove the plan tag (term finished)           |
+| `subscription.halted`     | Identify member → clear all plan tags (retries exhausted)     |
+| `subscription.cancelled`  | Identify member → clear all plan tags (member cancelled)      |
+| `subscription.completed`  | Identify member → clear all plan tags (term finished)         |
 | anything else             | Log and 200                                                   |
 
 Key design points (don't "simplify" these away):
@@ -54,15 +54,40 @@ Key design points (don't "simplify" these away):
 - **The tag rides in the subscription `notes`, not a lookup.** Stamped at
   `/join`, echoed on every webhook, so the handler needs no catalog lookup and
   stays correct even if `plans.json` changes.
-- **Tagging is idempotent.** A charge just (re-)adds the tag; no
-  reset/top-up/allowance and no cron. `subscription.pending` never removes the
-  tag — it's the grace window while Razorpay retries; only `halted` means
-  retries are exhausted.
+- **One plan tag at a time.** A charge adds the tag from `notes` and then clears
+  every *other* catalog tag, so an upgrade swaps `membership-starter` for
+  `membership-premium` instead of stacking both. The new tag goes on **before**
+  the old ones come off, so a mid-way failure can never leave a paying member
+  with no membership at all. Tagging stays idempotent — no reset/top-up/
+  allowance and no cron. `subscription.pending` never removes anything; it's the
+  grace window while Razorpay retries, and only `halted` means retries are
+  exhausted.
+- **Ending a membership clears every plan tag**, not just the one that
+  subscription granted — plus the tag in its `notes`, so a retired tier that's
+  no longer in `plans.json` still comes off. The tag list is exactly the
+  `plans.json` catalog: no prefix matching, so anything else on the customer
+  (`wholesale`, `newsletter`, a hand-applied comp tag) is never touched.
+  Consequence to know about: a member holding **two** active subscriptions who
+  cancels one loses the tag for both, and won't get it back until the surviving
+  subscription's next charge. The design assumes one membership per customer.
 - **SQLite dedupes webhook deliveries.** Razorpay redelivers on timeout;
   `membership_log` is the audit trail for "why does this member have this tag?"
+- **Identity is asymmetric — this is the sharp edge.** A grant knows the member
+  by the **payment** email (`payload.payment.entity.email`); a revoke has no
+  payment entity and can only ask Razorpay for the **customer record's** email.
+  Razorpay does not guarantee those match (the customer record can hold a
+  different address, or none, e.g. UPI-only checkouts). So every grant writes
+  `subscription_id -> shopify_customer_id` into `membership_log`, and a revoke
+  that can't find anyone by email falls back to that link. Without it, a
+  divergent email means the untag finds nobody and the tag stays on.
 - **Fails loudly** (logged with `needs_attention`) when a charge has no
-  `plan_tag`, or when a revoke can't resolve the member's email (so the tag
-  isn't silently left on a cancelled member).
+  `plan_tag`, and when a revoke can identify **no** customer at all — by email
+  or by grant history — so the tag is never silently left on a cancelled member.
+  A revoke has no quiet no-op path; every branch logs.
+- **Logs go to a file as well as stdout** (`LOG_FILE`, default
+  `./logs/membership.log`, size-rotated). A webhook that fails after we've
+  already 200'd it is never redelivered, so that line is the only record it
+  happened — it must not depend on stdout being captured.
 
 ## Setup
 
@@ -231,7 +256,10 @@ Liveness probe for the proxy / systemd.
 
 ### Logs
 
-One JSON line per event on stdout/stderr. The line to alert on:
+One JSON line per event, written to **both** stdout/stderr and the rotating log
+file (`LOG_FILE`, default `./logs/membership.log`; `LOG_MAX_BYTES` /
+`LOG_MAX_FILES` tune rotation, `LOG_FILE=off` disables the file). The file is the
+copy that survives a supervisor which discards stdout. The line to alert on:
 
 ```
 "msg":"EVENT PROCESSING FAILED AFTER ACK — needs manual attention","needs_attention":true
@@ -249,6 +277,45 @@ sqlite3 data/membership.db \
 A `processed_events` row with **no** matching `membership_log` rows for a
 `subscription.charged` event means processing died mid-flight (crash/API
 failure) — re-apply the tag by hand in Shopify admin.
+
+### A cancellation didn't remove the tag
+
+Work down the log file — each step distinguishes the next possibility:
+
+```bash
+grep '"eventType":"subscription.cancelled"' logs/membership.log
+```
+
+1. **No `"msg":"webhook received"` line at all** — the event never reached us.
+   Either `subscription.cancelled` isn't in the Razorpay dashboard's active
+   events, or the cancellation was scheduled for cycle end (Razorpay only emits
+   `subscription.cancelled` when it actually takes effect, not when it's
+   requested). Check the subscription's status in the Razorpay dashboard.
+2. **`webhook rejected: bad signature`** — `RAZORPAY_WEBHOOK_SECRET` doesn't
+   match the dashboard.
+3. **`revoke: start` then nothing** — see which branch logged next:
+   - `revoke: no Shopify customer matches the Razorpay email` — the payment
+     email and the Razorpay customer email diverge. Expect a following
+     `revoke: recovered the customer from this subscription's grant history`;
+     the `grantedToEmail` field shows the address the tag was actually applied
+     under.
+   - `revoke: Razorpay customer lookup failed` — Razorpay API error; the grant
+     history fallback runs next.
+   - `EVENT PROCESSING FAILED AFTER ACK` with `NOT removed` — neither route
+     identified anyone. If the subscription was never charged, no tag was ever
+     applied and this is safe to ignore; otherwise remove the tag in Shopify
+     admin by hand.
+4. **`plan tag revoked`** — we removed it. `identifiedVia` says how
+   (`razorpay_email` or `grant_history`), `clearedTags` is what we asked Shopify
+   to remove, and `customerTags` is what the customer was left holding —
+   straight from Shopify's mutation response, so it's the authoritative answer
+   to "did the tag actually come off?". If a plan tag is still in
+   `customerTags`, it isn't in `plans.json` and wasn't this subscription's
+   `notes.plan_tag`; add it to the catalog or clear it by hand.
+
+Note that grant history only covers subscriptions **charged since this version
+was deployed** — rows written earlier have no `subscription_id`, so an older
+member with a divergent email falls through to the loud failure in step 3.
 
 ### VPS deploy (Hetzner + systemd + Caddy)
 

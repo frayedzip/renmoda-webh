@@ -282,9 +282,20 @@ Confirm in Shopify Admin that the customer exists and carries the plan tag.
 
 ## Operations
 
-- **Logs:** `journalctl -u renmoda-membership -f`. The line to alert on:
+- **Logs:** `journalctl -u renmoda-membership -f`, or the log file the service
+  writes itself: `tail -f /opt/renmoda-membership/logs/membership.log` (set by
+  `LOG_FILE`, rotated at `LOG_MAX_BYTES`, `LOG_MAX_FILES` generations kept). The
+  file exists so the record survives journald retention. The line to alert on:
   `"needs_attention":true` (a paid event we already 200'd that failed — Razorpay
-  won't redeliver it, so it needs a human).
+  won't redeliver it, so it needs a human):
+  ```bash
+  grep '"needs_attention":true' /opt/renmoda-membership/logs/membership.log
+  ```
+  The `renmoda` user must be able to write that directory — if it can't, the
+  service still boots and logs `file logging disabled: cannot open log file`.
+- **A cancellation that didn't untag:** grep the log file for the subscription
+  id; the `revoke:` lines name the exact branch taken. See "A cancellation
+  didn't remove the tag" in the README for the walkthrough.
 - **Backups (important):** `data/membership.db` holds the Shopify offline token,
   webhook dedupe memory, and the tag audit log. Back it up:
   ```bash

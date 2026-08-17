@@ -13,10 +13,13 @@ export function normalizeCustomerGid(id) {
   throw new Error(`Invalid Shopify customer id: "${id}" (expected a numeric id or gid://shopify/Customer/...)`);
 }
 
+// Both mutations ask for the resulting tag list back. Shopify returns it in the
+// same round trip, so the caller can log what the customer actually ended up
+// with — no extra read, and no guessing whether a tag really came off.
 const TAGS_ADD_MUTATION = `
   mutation AddTags($id: ID!, $tags: [String!]!) {
     tagsAdd(id: $id, tags: $tags) {
-      node { id }
+      node { id ... on Customer { tags } }
       userErrors { field message }
     }
   }
@@ -25,7 +28,7 @@ const TAGS_ADD_MUTATION = `
 const TAGS_REMOVE_MUTATION = `
   mutation RemoveTags($id: ID!, $tags: [String!]!) {
     tagsRemove(id: $id, tags: $tags) {
-      node { id }
+      node { id ... on Customer { tags } }
       userErrors { field message }
     }
   }
@@ -116,14 +119,22 @@ export function createShopifyService(config, deps = {}) {
       await tokenProvider.getToken();
     },
 
+    // Both return the customer's resulting tags (or null if Shopify didn't echo
+    // a Customer node back).
     async addTag(customerGid, tag) {
       const data = await graphql(TAGS_ADD_MUTATION, { id: customerGid, tags: [tag] });
       assertNoUserErrors('tagsAdd', data.tagsAdd?.userErrors);
+      return data.tagsAdd?.node?.tags ?? null;
     },
 
-    async removeTag(customerGid, tag) {
-      const data = await graphql(TAGS_REMOVE_MUTATION, { id: customerGid, tags: [tag] });
+    // tagsRemove is idempotent and takes a list: passing tags the customer
+    // doesn't have is a no-op, and tags NOT in the list are left untouched —
+    // which is what keeps non-membership tags (wholesale, newsletter, …) safe.
+    async removeTags(customerGid, tags) {
+      if (tags.length === 0) return null;
+      const data = await graphql(TAGS_REMOVE_MUTATION, { id: customerGid, tags });
       assertNoUserErrors('tagsRemove', data.tagsRemove?.userErrors);
+      return data.tagsRemove?.node?.tags ?? null;
     },
 
     async findCustomerByEmail(email) {

@@ -110,11 +110,24 @@ export function loadConfig(env = process.env) {
 
   const plansPath = env.PLANS_PATH ?? './plans.json';
 
+  // On by default: the post-ack failure log is the ONLY record that a cancelled
+  // member kept their tag (Razorpay never redelivers an event we 200'd), so it
+  // must survive whatever supervisor happens to be swallowing stdout.
+  // LOG_FILE=off (or empty) turns it off for environments that capture stdout
+  // properly and don't want a second copy.
+  const rawLogFile = (env.LOG_FILE ?? './logs/membership.log').trim();
+  const logFile = !rawLogFile || rawLogFile.toLowerCase() === 'off' ? null : rawLogFile;
+
   return {
     port: toInt(env.PORT ?? '3000', 'PORT'),
     dbPath: env.DB_PATH ?? './data/membership.db',
     plansPath,
     plans: loadPlans(plansPath),
+    log: {
+      file: logFile,
+      maxBytes: toInt(env.LOG_MAX_BYTES ?? '10485760', 'LOG_MAX_BYTES'), // 10 MiB
+      maxFiles: toInt(env.LOG_MAX_FILES ?? '5', 'LOG_MAX_FILES'),
+    },
     razorpay: {
       keyId: env.RAZORPAY_KEY_ID,
       keySecret: env.RAZORPAY_KEY_SECRET,

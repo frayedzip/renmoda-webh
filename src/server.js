@@ -1,7 +1,7 @@
 import { pathToFileURL } from 'node:url';
 import express from 'express';
 import { loadConfig } from './lib/config.js';
-import { createLogger } from './lib/log.js';
+import { createLogger, openLogSink } from './lib/log.js';
 import { createStore } from './db/store.js';
 import { createRazorpayService } from './services/razorpay.js';
 import { createShopifyService } from './services/shopify.js';
@@ -46,12 +46,13 @@ export function createApp(deps) {
 
 function main() {
   const config = loadConfig();
-  const log = createLogger({ service: 'renmoda-membership' });
+  const logSink = openLogSink(config.log);
+  const log = createLogger({ service: 'renmoda-membership' }, { sink: logSink });
 
   const store = createStore(config.dbPath);
   const shopify = createShopifyService(config, { log, store });
   const razorpay = createRazorpayService(config);
-  const membership = createMembershipService({ store, shopify, razorpay, log });
+  const membership = createMembershipService({ config, store, shopify, razorpay, log });
 
   const app = createApp({ config, store, shopify, razorpay, membership, log });
   const server = app.listen(config.port, () => {
@@ -59,6 +60,7 @@ function main() {
       port: config.port,
       shop: config.shopify.shop,
       plans: Object.keys(config.plans),
+      logFile: logSink?.path ?? null,
     });
   });
 
@@ -96,6 +98,7 @@ function main() {
     await app.drainWebhooks();
     store.close();
     log.info('shutdown complete');
+    logSink?.close();
     process.exit(0);
   }
 
